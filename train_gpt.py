@@ -44,8 +44,8 @@ dynamo.config.recompile_limit = 64
 rank = int(os.environ["RANK"])
 world_size = int(os.environ["WORLD_SIZE"])
 assert 8 % world_size == 0, "world_size must be a divisor of 8"
-grad_accum_steps = 8 // world_size
-grad_scale = 1 / grad_accum_steps # consistent grad magnitudes between different num_devices
+grad_accum_steps = (8 if world_size >= 8 else 16) // world_size  # 16 for small world_size to keep microbatch ≤ 24576 tokens on 32GB GPUs
+grad_scale = 1 / grad_accum_steps
 assert torch.cuda.is_available()
 device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
 torch.cuda.set_device(device)
@@ -1021,7 +1021,14 @@ class AttnArgs:
     ve_gate_w: torch.Tensor
     train_max_seq_len: torch.Tensor
 
-flash_attn_interface = get_kernel('varunneal/flash-attention-3').flash_attn_interface
+_sm = torch.cuda.get_device_capability()
+_sm_version = _sm[0] * 10 + _sm[1]
+if _sm_version < 120:
+    flash_attn_interface = get_kernel('varunneal/flash-attention-3').flash_attn_interface
+else:
+    # FA3 is only compiled for SM90 (Hopper); use flex_attention on Blackwell+
+    from torch.nn.attention.flex_attention import flex_attention as _flex_attn, create_block_mask as _create_block_mask
+    flash_attn_interface = None
 
 class CausalSelfAttention(nn.Module):
     def __init__(self, dim: int, head_dim: int, num_heads: int, paired: bool = False):
@@ -1048,7 +1055,7 @@ class CausalSelfAttention(nn.Module):
         train_max_seq_len = attn_args.train_max_seq_len
 
         q, k, v = F.linear(x, sa_lambdas[0] * qkvo_w[:self.dim * 3].type_as(x)).view(B, T, 3 * self.num_heads, self.head_dim).chunk(3, dim=-2)
-        max_len = train_max_seq_len if self.training else (args.val_batch_size // (grad_accum_steps * world_size))
+        max_len = train_max_seq_len if self.training else (args.val_batch_size // world_size)
 
         q, k = norm(q), norm(k) # QK norm @Grad62304977
 
@@ -1086,10 +1093,23 @@ class CausalSelfAttention(nn.Module):
             max_len = 2 * max_len
 
         # use flash_attn over flex_attn @varunneal. flash_attn_varlen suggested by @YouJiacheng
-        y = flash_attn_interface.flash_attn_varlen_func(q[0], k[0], v[0], cu_seqlens_q=seqlens, cu_seqlens_k=seqlens,
-                                                        max_seqlen_q=max_len, max_seqlen_k=max_len,
-                                                        causal=True, softmax_scale=yarn.attn_scale, window_size=(bm_size, 0))
-        y = y.view(B, T, self.num_heads, self.head_dim)
+        if flash_attn_interface is not None:
+            y = flash_attn_interface.flash_attn_varlen_func(q[0], k[0], v[0], cu_seqlens_q=seqlens, cu_seqlens_k=seqlens,
+                                                            max_seqlen_q=max_len, max_seqlen_k=max_len,
+                                                            causal=True, softmax_scale=yarn.attn_scale, window_size=(bm_size, 0))
+            y = y.view(B, T, self.num_heads, self.head_dim)
+        else:
+            # flex_attention fallback for Blackwell (SM120+) where FA3 is not compiled
+            T_total = q.shape[1]
+            seq_lengths = seqlens[1:] - seqlens[:-1]
+            doc_ids = torch.repeat_interleave(torch.arange(len(seq_lengths), device=seqlens.device), seq_lengths)
+            _bm, _scale, _doc_ids = bm_size, yarn.attn_scale, doc_ids
+            def _mask_mod(b, h, q_idx, kv_idx):
+                return (q_idx >= kv_idx) & ((q_idx - kv_idx) < _bm) & (_doc_ids[q_idx] == _doc_ids[kv_idx])
+            block_mask = _create_block_mask(_mask_mod, B=None, H=None, Q_LEN=T_total, KV_LEN=T_total, device=q.device)
+            y = _flex_attn(q.permute(0, 2, 1, 3), k.permute(0, 2, 1, 3), v.permute(0, 2, 1, 3),
+                           block_mask=block_mask, scale=_scale).permute(0, 2, 1, 3)
+            y = y.view(B, T, self.num_heads, self.head_dim)
         y = y * torch.sigmoid(F.linear(x[..., :12], attn_gate_w)).view(B, T, self.num_heads, 1)
         y = y.contiguous().view(B, T, self.num_heads * self.head_dim) # re-assemble all head outputs side by side
         y = F.linear(y, sa_lambdas[1] * qkvo_w[self.dim * 3:].type_as(y))  # sa_lambdas[1] pre-multiplied to O @shenberg
@@ -1373,22 +1393,41 @@ def _load_data_shard(file: Path):
 BOS_ID = 50256
 
 class Shard:
-    def __init__(self, tokens: Tensor, world_size: int = 1):
+    def __init__(self, tokens: Tensor, world_size: int = 1, shuffle: bool = False):
         self.tokens = tokens
         self.size = tokens.numel()
         self.world_size = world_size
+        self.shuffle = shuffle
         self.i = 0
 
         # Partial index now, full index async
-        self.bos_idx = (tokens[:6_000_000] == BOS_ID).nonzero(as_tuple=True)[0].to(torch.int64).cpu().numpy()
+        bos_idx = (tokens[:6_000_000] == BOS_ID).nonzero(as_tuple=True)[0].to(torch.int64).cpu().numpy()
+        # bos_ends[i] = natural end of document i (start of next doc, or end of shard)
+        bos_ends = np.empty_like(bos_idx)
+        bos_ends[:-1] = bos_idx[1:]
+        bos_ends[-1] = self.size
+        if shuffle and len(bos_idx) > 0:
+            perm = np.random.permutation(len(bos_idx))
+            bos_idx, bos_ends = bos_idx[perm], bos_ends[perm]
+        self.bos_idx = bos_idx
+        self.bos_ends = bos_ends
         self._full_idx = None
+        self._full_ends = None
         self._loader_thread = None
         self._ready = threading.Event()
         self._loader_thread = threading.Thread(target=self._scan)
         self._loader_thread.start()
 
     def _scan(self):
-        self._full_idx = (self.tokens == BOS_ID).nonzero(as_tuple=True)[0].to(torch.int64).cpu().numpy()
+        full_idx = (self.tokens == BOS_ID).nonzero(as_tuple=True)[0].to(torch.int64).cpu().numpy()
+        full_ends = np.empty_like(full_idx)
+        full_ends[:-1] = full_idx[1:]
+        full_ends[-1] = self.size
+        if self.shuffle and len(full_idx) > 0:
+            perm = np.random.permutation(len(full_idx))
+            full_idx, full_ends = full_idx[perm], full_ends[perm]
+        self._full_idx = full_idx
+        self._full_ends = full_ends
         self._ready.set()
 
     def _maybe_switch(self):
@@ -1396,6 +1435,7 @@ class Shard:
         if self.bos_idx is not self._full_idx and self._ready.is_set():
             self._loader_thread.join()
             self.bos_idx = self._full_idx
+            self.bos_ends = self._full_ends
 
     def next_batch(self, num_tokens_local: int, max_seq_len: int):
         self._maybe_switch()
@@ -1411,7 +1451,7 @@ class Shard:
                     raise StopIteration(f"Insufficient BOS ahead; hit tail of shard.")
                 cur = self.bos_idx[idx]
                 starts[r].append(cur)
-                end = min(self.bos_idx[idx + 1] if idx + 1 < n else self.size,
+                end = min(self.bos_ends[idx],  # natural end of this doc regardless of access order
                           cur + max_seq_len,
                           cur + num_tokens_local - cur_len + 1)
                 ends[r].append(end)
@@ -1423,13 +1463,13 @@ class Shard:
         return starts, ends
 
     @staticmethod
-    def load_async(file: Path, world_size: int = 1):
+    def load_async(file: Path, world_size: int = 1, shuffle: bool = False):
         """Returns getter function for async shard loading"""
         result = {}
         ready = threading.Event()
         def load():
             tokens = _load_data_shard(file)
-            result['shard'] = Shard(tokens, world_size)
+            result['shard'] = Shard(tokens, world_size, shuffle=shuffle)
             ready.set()
         thread = threading.Thread(target=load)
         thread.start()
@@ -1456,8 +1496,9 @@ def get_bigram_hash(x):
     out[1:] = torch.bitwise_xor(rand_int_1 * out[1:], rand_int_2 * out[:-1]) % mod
     return out
 
-def distributed_data_generator(filename_pattern: str, num_tokens: int, max_seq_len: int, grad_accum_steps: int = 1, align_to_bos: bool = True):
+def distributed_data_generator(filename_pattern: str, num_tokens: int, max_seq_len: int, grad_accum_steps: int = 1, align_to_bos: bool = True, shuffle: bool = False):
     # align_to_bos: each sequence begins with Beginning of Sequence token, sequences truncated to max_seq_len
+    # shuffle: randomize document order within each shard for better gradient diversity on small world_size
     rank = dist.get_rank() if dist.is_initialized() else 0
     world_size = dist.get_world_size() if dist.is_initialized() else 1
     assert num_tokens % (world_size * grad_accum_steps) == 0, "Batch size must be divisible by world size"
@@ -1470,8 +1511,8 @@ def distributed_data_generator(filename_pattern: str, num_tokens: int, max_seq_l
     file_iter = iter(files)  # Use itertools.cycle(files) for multi-epoch training
     tokens = _load_data_shard(next(file_iter))
     if align_to_bos:
-        shard = Shard(tokens, world_size)
-        next_shard_getter = Shard.load_async(next(file_iter), world_size)
+        shard = Shard(tokens, world_size, shuffle=shuffle)
+        next_shard_getter = Shard.load_async(next(file_iter), world_size, shuffle=shuffle)
     else:
         pos = 0  # for unaligned case
 
@@ -1488,7 +1529,7 @@ def distributed_data_generator(filename_pattern: str, num_tokens: int, max_seq_l
                 shard = next_shard_getter()
                 tokens = shard.tokens
                 try:
-                    next_shard_getter = Shard.load_async(next(file_iter), world_size)
+                    next_shard_getter = Shard.load_async(next(file_iter), world_size, shuffle=shuffle)
                 except StopIteration:
                     next_shard_getter = None  # no more shards to preload
                 continue
@@ -1548,7 +1589,7 @@ class Hyperparameters:
     val_files: str = os.path.join(data_path, "data/fineweb10B/fineweb_val_*.bin") # input .bin to eval validation loss on
     val_tokens: int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     # batch sizes
-    val_batch_size: int = 4 * 64 * 1024 * 8
+    val_batch_size: int = 4 * 64 * 1024 * world_size
     # schedule
     num_scheduled_iterations: int = 1490  # number of steps to complete lr and ws schedule
     num_extension_iterations: int = 40  # number of steps to continue training at final lr and ws
@@ -1871,7 +1912,7 @@ model: nn.Module = GPT(
     num_heads=6,
     head_dim=128,
     model_dim=768,
-    max_seq_len=args.val_batch_size // (grad_accum_steps * world_size)
+    max_seq_len=args.val_batch_size // world_size
 ).cuda()
 for m in model.modules():
     if isinstance(m, (nn.Embedding, nn.Linear)):
@@ -1894,8 +1935,8 @@ print0("Compiling model and warming up kernels (~7 minutes on first execution)",
 # Warmup the training kernels, then re-initialize the state so we aren't cheating
 initial_state = dict(model=copy.deepcopy(model.state_dict()),
                      optimizer=training_manager.get_state()) # save the initial state
-train_loader = distributed_data_generator(args.train_files, TRAINING_STAGES[0].batch_size, TRAINING_STAGES[0].train_max_seq_len, grad_accum_steps=grad_accum_steps)
-val_loader = distributed_data_generator(args.val_files, args.val_batch_size, -1, grad_accum_steps=grad_accum_steps, align_to_bos=False)
+train_loader = distributed_data_generator(args.train_files, TRAINING_STAGES[0].batch_size, TRAINING_STAGES[0].train_max_seq_len, grad_accum_steps=grad_accum_steps, shuffle=True)
+val_loader = distributed_data_generator(args.val_files, args.val_batch_size, -1, grad_accum_steps=2, align_to_bos=False)
 
 transition_steps = training_manager.get_transition_steps()
 # first and last pair of steps in each transition
@@ -1927,7 +1968,7 @@ model.train()
 ########################################
 #        Training and validation       #
 ########################################
-train_loader = distributed_data_generator(args.train_files, TRAINING_STAGES[0].batch_size, TRAINING_STAGES[0].train_max_seq_len, grad_accum_steps=grad_accum_steps)
+train_loader = distributed_data_generator(args.train_files, TRAINING_STAGES[0].batch_size, TRAINING_STAGES[0].train_max_seq_len, grad_accum_steps=grad_accum_steps, shuffle=True)
 
 gc.collect()
 
@@ -1948,9 +1989,9 @@ for step in range(train_steps + 1):
         torch.cuda.synchronize()
         training_time_ms += 1000 * (time.perf_counter() - t0)
         model.eval()
-        assert args.val_tokens % args.val_batch_size == 0
-        val_steps = grad_accum_steps * args.val_tokens // args.val_batch_size
-        val_loader = distributed_data_generator(args.val_files, args.val_batch_size, -1, grad_accum_steps=grad_accum_steps, align_to_bos=False)
+        assert args.val_tokens % (args.val_batch_size // 2) == 0
+        val_steps = args.val_tokens // (args.val_batch_size // 2)  # grad_accum_steps=2: 131,072-token chunks to avoid OOM on 32GB GPU
+        val_loader = distributed_data_generator(args.val_files, args.val_batch_size, -1, grad_accum_steps=2, align_to_bos=False)
         val_loss = 0
         with torch.no_grad():
             for _ in range(val_steps):

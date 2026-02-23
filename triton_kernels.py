@@ -116,7 +116,7 @@ def XXT(A: torch.Tensor, out: torch.Tensor):
         num_stages, num_warps = 4, 8
     else:
         BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K = 64, 128, 128
-        num_stages, num_warps = 4, 8
+        num_stages, num_warps = 3, 8  # 4 exceeds RTX 5090 SMEM via torch.compile warp-spec path
 
     grid = (batch_size * triton.cdiv(M, BLOCK_SIZE_M) * triton.cdiv(M, BLOCK_SIZE_N),)
     XXT_kernel[grid](
@@ -330,6 +330,8 @@ def linear_relu_square_kernel(a_desc, b_desc, c_desc, aux_desc,
 
 
 def linear_relu_square(a, b, aux=None):
+    a = a.contiguous()
+    b = b.contiguous()
     M, K = a.shape
     N, K = b.shape
     dtype = a.dtype
@@ -346,7 +348,7 @@ def linear_relu_square(a, b, aux=None):
     BLOCK_SIZE_M = 128
     BLOCK_SIZE_N = 256
     BLOCK_SIZE_K = 64
-    num_stages = 4 if FORWARD else 3
+    num_stages = 2 if FORWARD else 1  # 4/3 exceeds RTX 5090 shared memory limit (101376 bytes)
     num_warps = 8
 
     a_desc = TensorDescriptor.from_tensor(a, [BLOCK_SIZE_M, BLOCK_SIZE_K])
